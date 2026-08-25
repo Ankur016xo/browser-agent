@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Agent screenshots
+*.png
+
+# Environment / secrets
+.env
