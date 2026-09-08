@@ -12,6 +12,43 @@ from typing import Any
 
 from browser_agent.logging import get_logger
 
+
+def _repair_product_search_query(task: str, search_query: str) -> str:
+    """Fix generic product search queries like "product" or empty.
+    Handles common patterns and typos (e.g., "priceof").
+    Returns a more specific query if possible.
+    """
+    if search_query:
+        cleaned = re.sub(r"^(?:the\s+)?(?:price\s+of|priceof|price)\s+", "", search_query, flags=re.IGNORECASE).strip()
+        if cleaned and cleaned.lower() not in GENERIC_TARGETS:
+            return cleaned
+        if search_query.lower() not in GENERIC_TARGETS:
+            return search_query
+
+    # Normalise common typo
+    t = task.lower().replace("priceof", "price of")
+    # Pattern: average price of <category> in <location>
+    m = re.search(r"\b(?:average|mean|median).*?price\s+of\s+([a-zA-Z\s]+)(?:\s+in\s+([a-zA-Z\s]+))?\b", t)
+    if m:
+        cat = m.group(1).strip()
+        loc = m.group(2)
+        return f"{cat} in {loc}".strip() if loc else cat
+    # Pattern: price of <category>
+    m = re.search(r"\bprice\s+of\s+([a-zA-Z\s]+)", t)
+    if m:
+        return m.group(1).strip()
+    # Pattern: find ... priceof <category> or price <category>
+    m = re.search(r"\bfind\s+(?:the\s+)?(?:priceof|price\s+of|price)\s+([a-zA-Z\s]+)", t)
+    if m:
+        return m.group(1).strip()
+    # Pattern: (top|first|give me)? (\d+|word_numbers) (cheapest|best)? <category>
+    m_cat = re.search(r"^\s*(?:top\s+|first\s+|give\s+me\s+)?(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+(?:cheapest|best|top|affordable|expensive)?\s*([a-zA-Z\-_]+(?:\s+[a-zA-Z\-_]+)?)", t)
+    if m_cat:
+        cand = m_cat.group(1).strip()
+        if cand.lower() not in GENERIC_TARGETS and cand.lower() not in KNOWN_PLATFORMS:
+            return cand
+    return search_query
+
 logger = get_logger(__name__)
 
 KNOWN_PLATFORMS = {
@@ -99,6 +136,54 @@ class TaskPlan:
             parts.append(f"ranking={self.ranking_field} {self.ranking_order}")
         return ", ".join(parts)
 
+    def to_task_model(self) -> Any:
+        from browser_agent.task_model import TaskModel, ConstraintSpec, ProcedureSpec
+        
+        op_map = {"<": "<=", "<=": "<=", ">": ">=", ">=": ">=", "==": "==", "!=": "!="}
+        constraint_specs = []
+        for c in self.constraints:
+            fld = c.get("field", "")
+            raw_op = c.get("op", "==")
+            val = c.get("value")
+            op = op_map.get(raw_op, "==")
+            constraint_specs.append(ConstraintSpec(field=fld, operator=op, value=val))
+
+        proc_specs = []
+        for idx, pr in enumerate(self.procedural_requirements):
+            proc_specs.append(ProcedureSpec(
+                procedure_id=f"proc_{idx}",
+                order_index=idx,
+                action_type="navigate" if "open" in pr.lower() else "click",
+                semantic_target=pr,
+                target_type="content"
+            ))
+
+        intent_mapped = self.intent
+        if intent_mapped in ("product_search", "ranked_search"):
+            intent_mapped = "search"
+        elif intent_mapped == "table_understanding":
+            intent_mapped = "information_extraction"
+
+        valid_intents = ("search", "information_extraction", "navigation", "comparison", "aggregation", "action")
+        final_intent = intent_mapped if intent_mapped in valid_intents else "search"
+
+        return TaskModel(
+            raw_task=self.raw_task,
+            intent=final_intent,
+            target_entity=self.target,
+            target_type=self.target_type,
+            destination_platform=self.destination or None,
+            destination_url=self.destination_url,
+            search_query=self.search_query,
+            requested_information=tuple(self.requested_information),
+            constraints=tuple(constraint_specs),
+            quantity=self.quantity if self.quantity > 1 else None,
+            ranking_field=self.ranking_field,
+            ranking_order=self.ranking_order if self.ranking_field else None,
+            procedural_requirements=tuple(proc_specs),
+            ambiguity_state="resolved"
+        )
+
 
 GENERIC_TARGETS = {
     "product", "suitable product", "relevant product", "most relevant product",
@@ -107,6 +192,8 @@ GENERIC_TARGETS = {
     "video", "a video", "the video", "first video", "first relevant video", "relevant video",
     "song", "a song", "the song", "first song", "first relevant song", "relevant song",
     "track", "a track", "the track", "first track",
+    "cheapest", "best", "top", "lowest price", "highest rated", "cheapest one", "best one",
+    "one", "it", "them", "option", "options", "candidate", "candidates",
 }
 
 
@@ -144,23 +231,37 @@ def parse_task_plan(task: str) -> TaskPlan:
 
     # 2. RANKED SEARCH & PRODUCT SEARCH DETECTION
     is_ranked = bool(re.search(
-        r"\b(?:highest\s+rated|highest\s+ratings?|best\s+ratings?|best\s+rated|top\s+rated|highest\s+scoring|cheapest|lowest\s+price|most\s+expensive)\b",
+        r"\b(?:highest\s+rated|highest\s+ratings?|best\s+ratings?|best\s+rated|top\s+rated|highest\s+scoring|cheapest|cheap|lowest\s+price|most\s+expensive|best|top|affordable|popular|most\s+relevant)\b",
         lower
     ))
+    # Determine ranking field and order
     ranking_field = None
     ranking_order = "desc"
     if is_ranked:
-        if re.search(r"\b(?:cheapest|lowest\s+price)\b", lower):
+        if re.search(r"\b(?:cheapest|cheap|lowest\s+price)\b", lower):
             ranking_field = "price"
             ranking_order = "asc"
         else:
             ranking_field = "rating"
             ranking_order = "desc"
+    
+    # Early detection for average price queries to extract category and location
+    avg_price_match = re.search(r"\baverage\s+price\s+of\s+([a-zA-Z\s]+?)(?:\s+in\s+([a-zA-Z\s]+))?\b", lower)
+    if avg_price_match:
+        cat = avg_price_match.group(1).strip()
+        loc = avg_price_match.group(2)
+        avg_search_query = f"{cat} in {loc}".strip() if loc else cat
+        # Override search_query later via setting a flag
+        is_product = True
+        # Store in a temporary variable to be used later
+        _early_avg_search = avg_search_query
+    else:
+        _early_avg_search = ""
 
-    is_product = is_ranked or any(
+    is_product = (is_ranked or any(
         kw in lower
         for kw in ["product", "laptop bag", "bag", "bags", "shoe", "shoes", "headphone", "headphones", "earbuds", "laptop", "laptops", "buy", "under ₹", "under $", "price <"]
-    )
+    )) and destination != "wikipedia"
 
     # 3. ENTITY & INFORMATION EXTRACTION FOR NON-PRODUCT TASKS
     target = ""
@@ -171,14 +272,20 @@ def parse_task_plan(task: str) -> TaskPlan:
     constraints: list[dict[str, Any]] = []
     output_fields: list[str] = []
 
-    qty_m = re.search(r"\b(\d+)\s+(?:units?|items?)\b", lower)
+    # Quantity detection: independent from ranking
+    qty_m = re.search(r"\b(?:top|first|give\s+me|find|show|get)\s+([2-9]|10|[1-9]\d+)\b", lower)
+    if not qty_m:
+        qty_m = re.search(r"\b(\d+)\s+(?:units?|items?|options?|products?|results?|candidates?)\b", lower)
+    if not qty_m:
+        qty_m = re.search(r"(?<!under\s)(?<!below\s)(?<!above\s)(?<!over\s)(?<!at\s)(?<![₹$€£])(?<!rs\.\s)(?<!rs\s)\b([2-9]|10)\s+([a-zA-Z\-_]+)", lower)
+
     if qty_m:
         quantity = int(qty_m.group(1))
     else:
         # Handle word numbers (e.g., three, five)
-        word_numbers = {"one":1,"two":2,"three":3,"four":4,"five":5,"six":6,"seven":7,"eight":8,"nine":9,"ten":10}
+        word_numbers = {"two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
         for word, num in word_numbers.items():
-            if re.search(r"\\b"+word+r"\\b", lower):
+            if re.search(rf"\b{word}\b", lower):
                 quantity = num
                 break
 
@@ -194,6 +301,7 @@ def parse_task_plan(task: str) -> TaskPlan:
         output_fields.append("name")
     if "price" in lower:
         output_fields.append("price")
+        requested_info.append("price")
     if "rating" in lower:
         output_fields.append("rating")
     if "url" in lower:
@@ -201,12 +309,12 @@ def parse_task_plan(task: str) -> TaskPlan:
     # Known metadata extraction triggers
     if "official language" in lower:
         requested_info.append("official language")
-    elif "language" in lower and ("what is the language" in lower or "find the language" in lower or "find language" in lower or "official language" in lower):
+    elif "language" in lower:
         requested_info.append("language")
 
-    if "capital" in lower and ("capital of" in lower or "what is the capital" in lower or "find the capital" in lower or "its capital" in lower):
+    if "capital" in lower:
         requested_info.append("capital")
-    if "population" in lower and ("population of" in lower or "what is the population" in lower or "find the population" in lower or "its population" in lower):
+    if "population" in lower:
         requested_info.append("population")
     if "birth date" in lower or "date of birth" in lower or "born" in lower:
         requested_info.append("birth date")
@@ -224,6 +332,12 @@ def parse_task_plan(task: str) -> TaskPlan:
         requested_info.append("rating")
     if "product name" in lower or "name of the product" in lower:
         requested_info.append("product_name")
+
+    # If factual/informational attributes are requested, this is NOT a product search
+    has_factual_info = any(info in ["capital", "population", "official language", "language", "birth date", "heading", "page title"] for info in requested_info)
+    if has_factual_info:
+        is_product = False
+        is_ranked = False
 
     if not is_product:
         # Pattern A: "find (the|his|her|its)? <info> of/for/in <target>"
@@ -438,6 +552,23 @@ def parse_task_plan(task: str) -> TaskPlan:
         if not comparison_fields:
             comparison_fields = ["title", "price", "rating"]
 
+        comp_m = re.search(
+            r"\b(?:compare|comparison\s+of)\s+(?:the\s+)?(?:first\s+\d+\s+|top\s+\d+\s+)?(?:prices?|ratings?|features?|options?|costs?)?\s*(?:of|between|for)?\s*(.+?)(?:\s+and\s+(?:find|tell|report|show|pick|choose|give)|[,\.;\?!]|$)",
+            clean_task,
+            re.IGNORECASE,
+        )
+        if comp_m:
+            cand_comp = comp_m.group(1).strip()
+            cand_comp = re.sub(rf"\s+(?:on|in|via|from|at)\s+(?:{known_platforms_pat})$", "", cand_comp, flags=re.IGNORECASE).strip()
+            cand_comp = re.sub(r"^(?:the|a|an)\s+", "", cand_comp, flags=re.IGNORECASE).strip()
+            cand_comp = re.sub(r"^(?:first\s+\d+|top\s+\d+|\d+)\s+", "", cand_comp, flags=re.IGNORECASE).strip()
+            cand_comp = re.sub(r"\s+(under|below|above|with|priced|having|rated)\b.*$", "", cand_comp, flags=re.IGNORECASE).strip()
+            if cand_comp and cand_comp.lower() not in GENERIC_TARGETS:
+                if not explicit_search_for:
+                    explicit_search_for = cand_comp
+                if not target:
+                    target = cand_comp
+
     is_download_task = bool(re.search(r"\b(?:download\s+(?:the\s+)?[\w\s]{0,35}?(?:file|pdf|report|document|csv|image|video|it)|save\s+(?:as\s+)?[\w\s]{0,35}?(?:file|pdf))\b", lower))
     is_upload_task = bool(re.search(r"\b(?:upload\s+(?:the\s+)?[\w\s]{0,35}?(?:file|document|image|attachment|receipt|photo|pdf)|attach\s+(?:file|document))\b", lower))
     is_table_task = bool(re.search(r"\b(?:extract\s+(?:the\s+)?table|table\s+data|data\s+from\s+(?:the\s+)?table)\b", lower))
@@ -492,17 +623,33 @@ def parse_task_plan(task: str) -> TaskPlan:
 
     # 5. SEARCH QUERY SEPARATION (CRITICAL FIX)
     search_query = ""
-    if is_product or is_ranked:
+    if is_comparison_task and (explicit_search_for or target):
+        search_query = explicit_search_for or target
+    elif is_product or is_ranked or re.search(r"\baverage price of\b", lower):
         prod_cat_match = re.search(
-            r"\b(?:find|search\s+(?:(?:for|on|in|using|with|via)\s+[a-z0-9\.\-_]+\s+)*(?:for\s+)?|buy|look\s*up)\s+(?:me\s+)?(?:a\s+|an\s+|the\s+|some\s+)?(?:cheapest|best|top|affordable|expensive|lowest\s+price|highest\s+rated|popular|most\s+relevant|official)?\s*([a-z0-9\s\-_]+?)(?:\s+under|\s+below|\s+above|\s+with|\s+priced|\s+having|\s+rated|[,\.;]|$)",
+            r"\b(?:find|search\s+(?:(?:for|on|in|using|with|via)\s+[a-z0-9\.\-_]+\s+)*(?:for\s+)?|buy|look\s*up)\s+(?:me\s+)?(?:a\s+|an\s+|the\s+|some\s+)?(?:cheapest|best|top|affordable|expensive|lowest\s+price|highest\s+rated|popular|most\s+relevant)?\s*([a-z0-9\s\-_]+?)(?:\s+under|\s+below|\s+above|\s+with|\s+priced|\s+having|\s+rated|[,\.;]|$)",
             clean_task,
             re.IGNORECASE,
         )
         if prod_cat_match:
             cand_cat = prod_cat_match.group(1).strip()
+            # Remove deterministic articles
             cand_cat = re.sub(r"^(?:the|a|an)\s+", "", cand_cat, flags=re.IGNORECASE).strip()
+            # Remove ranking/instruction prefixes
+            cand_cat = re.sub(r"^(?:(?:me|the|a|an|some|cheapest|best|top|affordable|popular|lowest\s+price|highest\s+rated|most\s+relevant)\s+)+", "", cand_cat, flags=re.IGNORECASE).strip()
+            if cand_cat.lower() in GENERIC_TARGETS:
+                cand_cat = ""
+            # Append location if phrase includes "in <location>"
+            loc_match = re.search(r"\bin\s+([a-zA-Z\s]+)", clean_task)
+            if loc_match:
+                location = loc_match.group(1).strip()
+                cand_cat = f"{cand_cat} in {location}".strip()
             if cand_cat and cand_cat.lower() not in GENERIC_TARGETS:
                 search_query = cand_cat
+        # Repair generic product search query if still generic
+        search_query = _repair_product_search_query(clean_task, search_query)
+        if not search_query and _early_avg_search:
+            search_query = _early_avg_search
         if not search_query and explicit_search_for:
             search_query = explicit_search_for
         if not search_query:
@@ -516,17 +663,27 @@ def parse_task_plan(task: str) -> TaskPlan:
             search_query = clean_task
     elif target:
         search_query = target
+        # Attempt to extract specific product query for price related intents
+        if not search_query or re.search(r"\\bprice\\b", lower):
+            repaired = _repair_product_search_query(clean_task, search_query)
+            if repaired:
+                search_query = repaired
     else:
         search_query = clean_task
 
     # Clean query
     search_query = re.sub(r"^(?:the|a|an)\s+", "", search_query, flags=re.IGNORECASE).strip()
+    # Remove leading filler words and qualifiers (me, best, cheapest, top, affordable, expensive, lowest price, highest rated, most relevant)
+    search_query = re.sub(r"^(?:me\s+)?(?:(?:the|a|an)\s+)?(?:(?:best|cheapest|top|affordable|expensive|lowest\s+price|highest\s+rated|most\s+relevant)\s+)+", "", search_query, flags=re.IGNORECASE).strip()
+    # Remove trailing constraint words like 'under', 'below', etc.
+    search_query = re.sub(r"\s+(under|below|above|with|priced|having|rated)\b.*$", "", search_query, flags=re.IGNORECASE).strip()
     clean_q = re.sub(r"\s+(?:article|page|website|site)$", "", search_query, flags=re.IGNORECASE).strip()
     if clean_q:
         search_query = clean_q
     # Remove leading quantity words or digits (e.g., 'three', '5')
     quantity_pattern = r"^(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
     search_query = re.sub(quantity_pattern, "", search_query, flags=re.IGNORECASE).strip()
+    # Cheap handling is done via ranking metadata; no prefix added to search_query
 
     # Completion conditions
     completion_conditions = []
@@ -560,6 +717,7 @@ def parse_task_plan(task: str) -> TaskPlan:
         if info not in seen:
             seen.add(info)
             requested_info_canonical.append(info)
+
     return TaskPlan(
         raw_task=clean_task,
         destination=destination,
@@ -584,6 +742,11 @@ def parse_task_plan(task: str) -> TaskPlan:
         constraints=constraints,
         output_fields=output_fields
     )
+
+
+def parse_task_model(task: str) -> Any:
+    """Parse raw task directly into canonical TaskModel."""
+    return parse_task_plan(task).to_task_model()
 
 
 def _parse_media_procedural_requirements(clean_task: str, destination: str = "") -> list[str]:

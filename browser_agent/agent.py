@@ -28,7 +28,9 @@ from browser_agent.logging import get_logger, setup_logging
 from browser_agent.loop_detector import LoopDetector
 from browser_agent.perception import PerceptionEngine
 from browser_agent.state import ActionRecord, AgentMemory, AgentState, ElementInfo, PageState
-from browser_agent.verifier import ActionVerifier
+from browser_agent.verifier import ActionVerifier, IndependentVerifier
+from browser_agent.task_model import TaskModel
+from browser_agent.execution_state import ExecutionState
 from browser_agent.vision import (
     ask_vision_model,
     summarize_task_result,
@@ -179,6 +181,23 @@ def normalize_task(task: str) -> str:
     return plan.search_query or task.strip()
 
 
+def extract_candidate_identity(url: str, title: str = "") -> str:
+    """Extract a stable candidate identity from URL or title without platform-specific hardcoding."""
+    if not url:
+        return title.strip().lower() if title else "unknown_candidate"
+    clean_url = url.split("?")[0].split("#")[0].rstrip("/").lower()
+    id_m = re.search(r"/(?:dp|p|product|item)/([a-z0-9_-]+)", clean_url)
+    if id_m:
+        return id_m.group(1)
+    query_id_m = re.search(r"(?:pid|item_id|id|asin)=([a-z0-9_-]+)", url.lower())
+    if query_id_m:
+        return query_id_m.group(1)
+    parts = [p for p in clean_url.split("/") if p and p not in ("http:", "https:")]
+    if parts:
+        return parts[-1]
+    return clean_url
+
+
 def find_product_links(elements: list[ElementInfo]) -> list[ElementInfo]:
     """
     Find elements that link directly to individual product detail pages (/p/, /dp/, pid=).
@@ -298,8 +317,16 @@ class BrowserAgent:
         self.controller = BrowserController(self.config)
         self.perception = PerceptionEngine()
         self.verifier = ActionVerifier()
+        self.independent_verifier = IndependentVerifier()
+        self.task_plan: Any = None
+        self.task_model: TaskModel | None = None
+        self.execution_state: ExecutionState | None = None
         self.loop_detector = LoopDetector()
         self.constraints = TaskConstraints()
+        self.candidates_seen: set[str] = set()
+        self.candidates_valid: list[dict[str, Any]] = []
+        self.candidates_rejected: list[dict[str, Any]] = []
+        self.rejection_reasons: dict[str, list[str]] = {}
         self.evaluated_candidates: set[str] = set()
         self.evaluated_candidate_details: list[dict[str, Any]] = []
         # Exploration budget: maximum number of UNIQUE candidates inspected
@@ -390,8 +417,25 @@ class BrowserAgent:
             except Exception:
                 pass
 
+        # General requested information extraction (e.g. capital, population, official language)
+        if self.task_plan and getattr(self.task_plan, "requested_information", None):
+            try:
+                from browser_agent.exploration import inspect_page_for_requested_info
+                info_results = inspect_page_for_requested_info(page, self.task_plan.requested_information, target=getattr(self.task_plan, "target", None))
+                for info_k, info_v in info_results.items():
+                    if info_v:
+                        canonical_k = info_k
+                        for req_f in self.task_plan.requested_information:
+                            if req_f.lower().replace(" ", "_") == info_k.lower().replace(" ", "_"):
+                                canonical_k = req_f
+                                break
+                        updates[canonical_k] = str(info_v).strip()
+            except Exception as e:
+                logger.debug("General requested info extraction error: %s", e)
+
         # If on an individual product page (e.g. Flipkart /p/, Amazon /dp/), extract product details
         is_product_page = any(seg in curr_url.lower() for seg in ["/p/", "/dp/", "/product/", "/item/"])
+        cand_id = None
         if is_product_page:
             # 1. Product Title/Name from clean page title or DOM
             if " | flipkart" in curr_title.lower() or " : amazon" in curr_title.lower() or " | amazon" in curr_title.lower():
@@ -409,6 +453,23 @@ class BrowserAgent:
                     pass
             if not updates.get("product_name") and curr_title:
                 updates["product_name"] = curr_title.split("-")[0].strip()
+
+            # Register CandidateRecord in execution_state
+            if self.execution_state:
+                from browser_agent.execution_state import CandidateRecord
+                curr_cand_title = updates.get("product_name") or curr_title
+                for c in self.execution_state.candidates.values():
+                    if c.url == curr_url:
+                        cand_id = c.candidate_id
+                        break
+                if not cand_id:
+                    cand_id = f"cand_{len(self.execution_state.candidates) + 1}"
+                    cand = CandidateRecord(
+                        candidate_id=cand_id,
+                        title=curr_cand_title,
+                        url=curr_url,
+                    )
+                    self.execution_state.add_candidate(cand)
 
             # 2. Extract Price & Rating from DOM selectors and body text
             if hasattr(page, "evaluate"):
@@ -468,6 +529,73 @@ class BrowserAgent:
 
         if updates:
             self.memory.update_extracted_data(updates)
+            if self.execution_state:
+                from browser_agent.evidence import Evidence
+                from browser_agent.constraints import parse_numeric_price, parse_numeric_rating
+                for k, v in updates.items():
+                    norm_val = v
+                    if k == "price":
+                        p_num = parse_numeric_price(str(v))
+                        if p_num is not None:
+                            norm_val = p_num
+                    elif k == "rating":
+                        r_num = parse_numeric_rating(str(v))
+                        if r_num is not None:
+                            norm_val = r_num
+                    ev = Evidence(
+                        evidence_id=f"ev_{k}_{self.memory.step_count}_{int(time.time()*1000)}",
+                        candidate_id=cand_id,
+                        field=k,
+                        raw_value=v,
+                        normalized_value=norm_val,
+                        source="dom",
+                        confidence=1.0,
+                        page_url=curr_url,
+                        timestamp=time.time()
+                    )
+                    self.execution_state.add_evidence(ev)
+
+    def _detect_page_blocker(self, page: Any) -> str:
+        """Detect if active page has encountered a CAPTCHA, auth wall, or rate limit."""
+        if not is_page_alive(page):
+            return "none"
+        try:
+            page_text_lower = page.evaluate("() => document.body ? document.body.innerText.substring(0, 3000).toLowerCase() : ''")
+        except Exception:
+            page_text_lower = ""
+        
+        captcha_indicators = [
+            "enter the characters you see below",
+            "robot check",
+            "please verify you are a human",
+            "cf-turnstile",
+            "recaptcha",
+            "press & hold to prove you are human",
+            "verify you are human",
+            "security check",
+        ]
+        if any(ind in page_text_lower for ind in captcha_indicators):
+            return "captcha"
+
+        auth_indicators = [
+            "sign in to continue",
+            "login required",
+            "access denied",
+            "403 forbidden",
+            "please log in",
+        ]
+        if any(ind in page_text_lower for ind in auth_indicators):
+            return "auth"
+
+        rate_limit_indicators = [
+            "429 too many requests",
+            "rate limit exceeded",
+            "too many requests",
+        ]
+        if any(ind in page_text_lower for ind in rate_limit_indicators):
+            return "rate_limit"
+
+        return "none"
 
     def _check_and_dismiss_modal(self, page: Any, elements: list[ElementInfo]) -> bool:
         """Check for blocking login/signup/modal overlay and dismiss it if present."""
@@ -520,6 +648,8 @@ class BrowserAgent:
         self._resume_event.set()
 
         self.task_plan = parse_task_plan(task)
+        self.task_model = self.task_plan.to_task_model()
+        self.execution_state = ExecutionState(task=self.task_model)
         # Determine the number of valid candidates the user requests.
         if getattr(self.task_plan, "quantity", None) is not None:
             self.requested_quantity = self.task_plan.quantity
@@ -529,8 +659,14 @@ class BrowserAgent:
         dest_url = self.task_plan.destination_url or extract_destination_url(task) or self.config.get("browser", {}).get("start_url", "https://duckduckgo.com")
 
         self.constraints = extract_task_constraints(task)
+        self.candidates_seen = set()
+        self.candidates_valid = []
+        self.candidates_rejected = []
+        self.rejection_reasons = {}
         self.evaluated_candidates = set()
         self.evaluated_candidate_details = []
+        self.candidates_inspected = 0
+        self.valid_candidates_found = 0
 
         self.search_results_url = None
 
@@ -621,14 +757,42 @@ class BrowserAgent:
                 if hasattr(self.controller, "get_tab_registry"):
                     self.memory.tab_registry = self.controller.get_tab_registry()
 
+                # Runtime Blocker Detection & ExecutionState Observation
+                blocker = self._detect_page_blocker(page)
+                if self.execution_state:
+                    from browser_agent.execution_state import Observation
+                    obs = Observation(
+                        observation_id=f"obs_{step}",
+                        timestamp=time.time(),
+                        url=safe_page_url(page),
+                        title=safe_page_title(page),
+                        dom_hash="",
+                        visual_hash="",
+                        is_blocked=(blocker != "none"),
+                        blocker_type=blocker if blocker in ("captcha", "auth", "rate_limit") else "none",
+                    )
+                    self.execution_state.apply_observation(obs)
+
+                if blocker != "none":
+                    if self.execution_state:
+                        self.execution_state.blocker_state = blocker
+                    self.memory.extracted_data["status"] = "BLOCKED"
+                    self.memory.extracted_data["blocker"] = blocker
+                    self.log(f"Active runtime blocker detected on page: {blocker.upper()}. Halting loop immediately.")
+                    break
 
                 # Auto-ground visible page metadata
                 self._ground_page_metadata(page)
 
                 # Check and advance open/visit procedure if satisfied on current page
                 if self.memory.current_procedure:
+                    proc_idx = self.memory.procedure_index
+                    curr_p = self.memory.current_procedure
                     if self.memory.check_and_advance_open_procedure(page):
-                        self.log(f"Open procedure satisfied on page: '{self.memory.completed_procedures[-1]}'. Advanced procedure index to {self.memory.procedure_index}/{self.memory.total_procedures}.")
+                        self.log(f"Open procedure satisfied on page: '{curr_p}'. Advanced procedure index to {self.memory.procedure_index}/{self.memory.total_procedures}.")
+                        if self.execution_state:
+                            self.execution_state.record_procedure_result(f"proc_{proc_idx}", True)
+                            self.execution_state.record_procedure_result(curr_p, True)
 
                 # Check if all requested information is already grounded and satisfied
                 if self.memory.extracted_data.get("status") == "NO_MATCH":
@@ -646,36 +810,57 @@ class BrowserAgent:
                             page_text = ""
                         candidate_dict = {**self.memory.extracted_data, "title": safe_page_title(page), "url": safe_page_url(page)}
                         eval_res = evaluate_candidate(candidate_dict, page_text, self.constraints)
+                        cand_id = extract_candidate_identity(safe_page_url(page), safe_page_title(page))
+                        if cand_id not in self.candidates_seen:
+                            self.candidates_seen.add(cand_id)
                         if eval_res["satisfied"]:
-                            self.log("All requested information and constraints are SATISFIED on current product page. Concluding task immediately.")
-                            action = {
-                                "action": "done",
-                                "confidence": 0.98,
-                                "reasoning": f"Product satisfies all constraints: {self.constraints.summary()}",
-                                "result": dict(self.memory.extracted_data),
-                            }
-                            self.memory.last_reasoning = action.get("reasoning", "")
-                            self.memory.last_confidence = float(action.get("confidence", 0.98))
-                            record = ActionRecord(
-                                step=step,
-                                action=action,
-                                success=True,
-                                verified=True,
-                                state_change=False,
-                                reasoning=action.get("reasoning", ""),
-                                confidence=action.get("confidence", 1.0),
-                                url_before=safe_page_url(page),
-                                url_after=safe_page_url(page),
-                                title_before=safe_page_title(page),
-                                title_after=safe_page_title(page),
-                            )
-                            self.memory.add_action(record)
-                            task_completed = True
-                            break
+                            if not any(c.get("url") == page.url or c.get("name") == candidate_dict.get("title") for c in self.candidates_valid):
+                                self.candidates_valid.append(candidate_dict)
+                                self.valid_candidates_found = len(self.candidates_valid)
+                            if self.execution_state:
+                                from browser_agent.execution_state import CandidateRecord
+                                cand_rec = CandidateRecord(
+                                    candidate_id=cand_id,
+                                    url=page.url,
+                                    title=safe_page_title(page),
+                                    status="accepted",
+                                )
+                                self.execution_state.add_candidate(cand_rec)
+                            target_qty = self.requested_quantity if self.requested_quantity > 0 else 1
+                            if len(self.candidates_valid) >= target_qty:
+                                self.log(f"All {target_qty} requested candidate(s) found and validated! Concluding task immediately.")
+                                action = {
+                                    "action": "done",
+                                    "confidence": 0.98,
+                                    "reasoning": f"Found {len(self.candidates_valid)} candidate(s) satisfying all constraints: {self.constraints.summary()}",
+                                    "result": dict(self.memory.extracted_data),
+                                }
+                                self.memory.last_reasoning = action.get("reasoning", "")
+                                self.memory.last_confidence = float(action.get("confidence", 0.98))
+                                record = ActionRecord(
+                                    step=step,
+                                    action=action,
+                                    success=True,
+                                    verified=True,
+                                    state_change=False,
+                                    reasoning=action.get("reasoning", ""),
+                                    confidence=action.get("confidence", 1.0),
+                                    url_before=safe_page_url(page),
+                                    url_after=safe_page_url(page),
+                                    title_before=safe_page_title(page),
+                                    title_after=safe_page_title(page),
+                                )
+                                self.memory.add_action(record)
+                                task_completed = True
+                                break
                 elif self.task_plan and self.task_plan.intent in ("navigation", "media_interaction") and (self.task_plan.target or self.task_plan.navigation_requirement or getattr(self.task_plan, "procedural_requirements", None)):
                     is_target_sat, target_reason = self.memory.is_target_page_satisfied(page)
                     is_proc_sat, _ = self.memory.is_procedure_satisfied(page)
                     if is_target_sat and is_proc_sat:
+                        if self.task_model and self.task_model.procedural_requirements and self.execution_state:
+                            for pr in self.task_model.procedural_requirements:
+                                self.execution_state.record_procedure_result(pr.procedure_id, True)
+                                self.execution_state.record_procedure_result(pr.semantic_target, True)
                         self.log(f"Goal SATISFIED: {target_reason}. Concluding task immediately.")
                         action = {
                             "action": "done",
@@ -702,6 +887,10 @@ class BrowserAgent:
                         task_completed = True
                         break
                 elif self.memory.is_task_satisfied(page, self.memory.task, self.constraints)[0]:
+                    if self.task_model and self.task_model.procedural_requirements and self.execution_state:
+                        for pr in self.task_model.procedural_requirements:
+                            self.execution_state.record_procedure_result(pr.procedure_id, True)
+                            self.execution_state.record_procedure_result(pr.semantic_target, True)
                     self.log("All task requirements (target, procedure, information) have been satisfied. Concluding task immediately.")
                     action = {
                         "action": "done",
@@ -943,8 +1132,9 @@ class BrowserAgent:
 
                 # PHASE B: SEARCH RESULTS PAGE DETERMINISTIC GROUNDING
                 elif is_search_results_page:
-                    if is_prod_task:
-                        candidate_prod_links = find_product_links(elements)
+                    is_ecom_site = any(ecom in curr_url_lower for ecom in ["amazon.", "flipkart.", "ebay.", "walmart."])
+                    candidate_prod_links = find_product_links(elements) if (is_prod_task and is_ecom_site) else []
+                    if candidate_prod_links:
                         # Filter unvisited candidates
                         unvisited = []
                         for elem in candidate_prod_links:
@@ -986,11 +1176,11 @@ class BrowserAgent:
                                 action = None
 
                     else:
-                        # General organic search results (e.g. YouTube videos, Wikipedia articles, Python docs)
+                        # General organic search results (e.g. DuckDuckGo flight results, YouTube videos, Wikipedia articles, Python docs)
                         pref = "video" if any(k in (self.task_plan.target if self.task_plan else "").lower() or k in self.memory.task.lower() for k in ["video", "song", "track"]) else None
                         best_cand = select_best_candidate_link(
                             elements,
-                            query=self.memory.normalized_query,
+                            query=self.memory.normalized_query or (self.task_plan.search_query if self.task_plan else ""),
                             target=self.task_plan.target if self.task_plan else "",
                             preferred_type=pref,
                             unvisited_only=True,
@@ -1148,6 +1338,14 @@ class BrowserAgent:
                     self.log(f"Loop detected! Applying structured recovery action: {loop_advice}")
                     recovery_action = self.loop_detector.get_recovery_action(self.memory, elements, page, failed_action=action)
                     action = recovery_action
+
+                # Stale Action Contract: Validate action freshness against active Observation
+                if self.execution_state and self.execution_state.current_observation:
+                    if "observation_id" not in action:
+                        action["observation_id"] = self.execution_state.current_observation.observation_id
+                    if not self.execution_state.validate_action_freshness(action):
+                        self.log(f"Stale or ungrounded action rejected: {action}. Re-observing page.")
+                        continue
 
                 self.log(f"AI ACTION: {action}")
                 self.memory.last_reasoning = action.get("reasoning", "")
@@ -1475,7 +1673,10 @@ class BrowserAgent:
                         is_success = False
                         final_state_str = "INCOMPLETE"
                 else:
-                    ver_result = verify_task_completion(task, page, final_screenshot)
+                    try:
+                        ver_result = verify_task_completion(task, page, final_screenshot)
+                    except Exception as exc:
+                        ver_result = {"verified": False, "reason": f"Verification error: {exc}", "confidence": 0.0}
                     is_success = bool(ver_result.get("verified", False))
                     final_state_str = "SUCCESS" if is_success else "INCOMPLETE"
             elif is_info_task and info_satisfied:
@@ -1487,12 +1688,45 @@ class BrowserAgent:
                 is_success = True
                 final_state_str = "SUCCESS"
             else:
-                ver_result = verify_task_completion(task, page, final_screenshot)
+                try:
+                    ver_result = verify_task_completion(task, page, final_screenshot)
+                except Exception as exc:
+                    ver_result = {"verified": False, "reason": f"Verification error: {exc}", "confidence": 0.0}
                 if is_info_task and not info_satisfied:
                     ver_result["verified"] = False
                     ver_result["reason"] = "Requested information criteria not fully satisfied on destination page."
                 is_success = bool(ver_result.get("verified", False))
                 final_state_str = "SUCCESS" if is_success else "FAILED"
+
+            # AUTHORITATIVE GATE: resolve_terminal_state
+            if self.execution_state:
+                from browser_agent.verifier import resolve_terminal_state
+                auth_status, auth_res = resolve_terminal_state(
+                    self.execution_state,
+                    verifier=self.independent_verifier or IndependentVerifier(),
+                )
+                final_state_str = auth_status
+                if auth_status == "SUCCESS":
+                    is_success = True
+                    ver_result = {
+                        "verified": True,
+                        "reason": auth_res.reason or "All criteria independently verified against evidence",
+                        "confidence": 1.0,
+                    }
+                elif auth_status == "NO_MATCH":
+                    is_success = True
+                    ver_result = {
+                        "verified": True,
+                        "reason": auth_res.reason or "No matching candidates found after exhaustive search",
+                        "confidence": 1.0,
+                    }
+                else:
+                    is_success = False
+                    ver_result = {
+                        "verified": False,
+                        "reason": auth_res.reason or f"Deterministic terminal state: {auth_status}",
+                        "confidence": 0.0,
+                    }
 
             self.log(f"Verification: {ver_result}")
 

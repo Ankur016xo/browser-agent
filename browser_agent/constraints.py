@@ -56,7 +56,26 @@ def parse_numeric_price(price_str: Any) -> float | None:
         return None
     if isinstance(price_str, (int, float)):
         return float(price_str)
-    s = str(price_str).replace(",", "").strip()
+    raw = str(price_str).strip()
+    # 1. Look for currency symbol or explicit price prefix first (e.g. ₹3,833, Rs. 1,299, $29.99)
+    curr_match = re.search(r"(?:[₹$£€]|rs\.?|inr)\s*([\d,]+(?:\.\d+)?)", raw, re.IGNORECASE)
+    if curr_match:
+        try:
+            return float(curr_match.group(1).replace(",", ""))
+        except ValueError:
+            pass
+    # 2. Reject percentages, discount amounts, review counts, and monthly EMI indicators
+    if any(suffix in raw.lower() for suffix in ["%", "off", "/month", "/mo", "per month", "reviews", "ratings"]):
+        return None
+    # 3. Look for trailing currency suffix (e.g. 3833/-)
+    trail_match = re.search(r"\b([\d,]+(?:\.\d+)?)\s*(?:[₹$£€]|rs\.?|inr|\b/-)", raw, re.IGNORECASE)
+    if trail_match:
+        try:
+            return float(trail_match.group(1).replace(",", ""))
+        except ValueError:
+            pass
+    # 4. Fall back to clean numeric string extraction
+    s = raw.replace(",", "").strip()
     match = re.search(r"[\d]+(?:\.\d+)?", s)
     if match:
         try:

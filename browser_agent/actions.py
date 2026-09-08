@@ -286,6 +286,11 @@ def _execute_type(page: Page, action: dict[str, Any], elements: list[ElementInfo
 def _execute_click(page: Page, action: dict[str, Any], elements: list[ElementInfo] | None = None) -> bool:
     """Click an element by ID, coordinate, or text."""
     target = str(action.get("target", "")).strip()
+    reasoning = str(action.get("reasoning", "")).strip()
+    if not target and reasoning:
+        m_quoted = re.search(r"['\"]([^'\"]{2,60})['\"]", reasoning)
+        if m_quoted:
+            target = m_quoted.group(1).strip()
     element_id = action.get("element_id") if action.get("element_id") is not None else action.get("target_id")
     if isinstance(element_id, (list, tuple)) and len(element_id) > 0:
         element_id = element_id[0]

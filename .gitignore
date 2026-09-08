@@ -23,4 +23,8 @@ build/
 node_modules/
 dist/
 .bolt/
-.v3/
+.v3/
+
+# Scratch & Data
+scratch/
+data/

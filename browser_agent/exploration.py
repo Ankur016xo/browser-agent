@@ -206,8 +206,9 @@ def find_candidate_content_items(
         elif any(k in proc_lower for k in ["doc", "documentation"]) and any(dh in href for dh in ["docs", "documentation"]):
             score += 35.0
 
-        # Position preference for top results
-        score += max(0.0, 10.0 - idx * 1.0)
+        # Position preference for top matching results only
+        if score > 0:
+            score += max(0.0, 10.0 - idx * 1.0)
 
         best_title = title or text or aria or href
         if score > 0:
@@ -252,134 +253,62 @@ def select_best_candidate_link(
 
 
 
-def inspect_page_for_requested_info(page: Page, requested_info: list[str], target: str | None = None) -> dict[str, Any]:
+def extract_price(page: Page, body_text: str, target: str | None = None) -> Any:
+    """Extract price from body_text, optionally using target for semantic extraction.
+    Returns a float when possible, otherwise raw string, or None if not found.
     """
-    Inspect page DOM / text for specific requested information items.
-    Returns dictionary of grounded extracted values. Supports optional target for semantic price grounding.
-    """
-    results: dict[str, Any] = {}
-    if not requested_info:
-        return results
-    try:
-        body_text = page.evaluate("() => document.body ? document.body.innerText : ''")
-    except Exception:
-        body_text = ""
-    if not body_text:
-        return results
-    for info in requested_info:
-        info_lower = info.lower()
-        # Official language extraction
-        if "official language" in info_lower or "language" in info_lower:
-            lang_match = re.search(
-                r"Official[\s\xa0]+languages?[\s\xa0:\t\n]+([^\n\r•\[]{2,60})",
-                body_text,
-                re.IGNORECASE,
+    # Semantic extraction if target provided
+    if target:
+        try:
+            price_match = page.evaluate(
+                """
+                (target) => {
+                    const norm = (s) => (s || '').toLowerCase();
+                    const targetLow = norm(target);
+                    const elems = Array.from(document.querySelectorAll('body *')).filter(el => el.innerText && norm(el.innerText).includes(targetLow));
+                    for (const el of elems) {
+                        const txt = el.innerText;
+                        let m = txt.match(/[\\$\\u20ac\\u00a3\\u20b9]\\s?[0-9,.]+/);
+                        if (m) return m[0];
+                        m = txt.match(/(?:price|cost|amount)[\\s:\\-]*\\s*(?:[\\$\\u20ac\\u00a3\\u20b9]|USD|EUR|GBP)?\\s*([\\d,.]+)/i);
+                        if (m) return m[1] ? m[1] : m[0];
+                    }
+                    return null;
+                }
+                """,
+                target,
             )
-            if not lang_match:
-                lang_match = re.search(
-                    r"(?:National\s+languages?|Official\s+language)\s*[:\t\n]?\s*([^\n\r•\(\)]{2,60})",
-                    body_text,
-                    re.IGNORECASE,
-                )
-            if lang_match:
-                extracted = lang_match.group(1).strip()
-                extracted = re.sub(r"\[[^\]]*\]", "", extracted).strip()
-                extracted = re.sub(r"([a-z])([A-Z])", r"\1, \2", extracted).strip()
-                if extracted and extracted.lower() not in {"article", "edit", "talk", "view history", "tools"}:
-                    results["official_language"] = extracted
-        # Capital extraction
-        if "capital" in info_lower:
-            cap_match = re.search(
-                r"Capital(?:\s+and\s+largest\s+city)?[\s\t\n:]+([A-Z][a-zA-Z \t\.-]{2,40})",
-                body_text,
-            )
-            if not cap_match:
-                cap_match = re.search(
-                    r"(?:Capital(?:\s+and\s+largest\s+city)?)\s*[:\t\n]?\s*([^\n\r•\(\)\t\[]{2,60})",
-                    body_text,
-                    re.IGNORECASE,
-                )
-            if cap_match:
-                extracted = cap_match.group(1).strip()
-                extracted = re.sub(r"\[[^\]]*\]", "", extracted).strip()
-                if extracted and extracted.lower() not in {"and largest city", "city", "none", "n/a", "official"}:
-                    results["capital"] = extracted
-        # Population extraction
-        if "population" in info_lower:
-            pop_match = re.search(
-                r"(?:^|[\n\r])\s*Population[\s\xa0\n\t•]+(?:[^\n\r]*[\n\r\t]+)?([0-9\.,\s]+(?:billion|million|trillion)?|\d[\d,]+)",
-                body_text,
-                re.IGNORECASE,
-            )
-            if not pop_match:
-                pop_match = re.search(
-                    r"Population\s*[:\t\n]?\s*([0-9\.,\s]+(?:billion|million|trillion)?|\d[\d,]+)",
-                    body_text,
-                    re.IGNORECASE,
-                )
-            if pop_match:
-                extracted = pop_match.group(1).strip()
-                extracted = re.sub(r"\[[^\]]*\]", "", extracted).strip()
-                if extracted:
-                    results["population"] = extracted
-        # Price extraction with optional target grounding
-        if "price" in info_lower:
+        except Exception as e:
+            logger.debug("Semantic price extraction failed: %s", e)
             price_match = None
-            if target:
-                try:
-                    price_match = page.evaluate(
-                        """
-                        (target) => {
-                            const norm = (s) => (s || '').toLowerCase();
-                            const targetLow = norm(target);
-                            const elems = Array.from(document.querySelectorAll('body *')).filter(el => el.innerText && norm(el.innerText).includes(targetLow));
-                            for (const el of elems) {
-                                const txt = el.innerText;
-                                let m = txt.match(/[\\$\\u20ac\\u00a3\\u20b9]\\s?[0-9,.]+/);
-                                if (m) return m[0];
-                                m = txt.match(/(?:price|cost|amount)[\\s:\\-]*\\s*(?:[\\$\\u20ac\\u00a3\\u20b9]|USD|EUR|GBP)?\\s*([\\d,.]+)/i);
-                                if (m) return m[1] ? m[1] : m[0];
-                            }
-                            return null;
-                        }
-                        """,
-                        target,
-                    )
-                except Exception as e:
-                    logger.debug("Semantic price extraction failed: %s", e)
-            if not price_match:
-                price_match = re.search(r"[\\$\\u20ac\\u00a3\\u20b9]\\s?[0-9,.]+", body_text)
-                if not price_match:
-                    price_match = re.search(
-                        r"(?:price|cost|amount)[\\s:\\-]*\\s*(?:[\\$\\u20ac\\u00a3\\u20b9]|USD|EUR|GBP)?\\s*([\\d,.]+)",
-                        body_text,
-                        re.IGNORECASE,
-                    )
-            if price_match:
-                raw_price = price_match.group(1) if price_match.lastindex else price_match.group(0)
-                numeric = re.sub(r"[\\$\\u20ac\\u00a3\\u20b9,]", "", raw_price)
-                try:
-                    results["price"] = float(numeric)
-                except ValueError:
-                    results["price"] = raw_price.strip()
-        # Page heading
-        if "heading" in info_lower:
-            try:
-                h1 = page.evaluate("() => document.querySelector('h1') ? document.querySelector('h1').innerText : ''").strip()
-                if h1:
-                    results["heading"] = h1
-            except Exception:
-                pass
-        # Page title
-        if "title" in info_lower:
-            t = page.title().strip()
-            if t:
-                results["title"] = t
-    return results
-    """
-    Inspect page DOM / text for specific requested information items.
-    Returns dictionary of grounded extracted values.
-    """
+        if price_match:
+            raw_price = price_match
+        else:
+            raw_price = None
+    else:
+        raw_price = None
+
+    if not raw_price:
+        # Fallback regex extraction
+        price_match = re.search(r"[\\$\\u20ac\\u00a3\\u20b9]\\s?[0-9,.]+", body_text)
+        if not price_match:
+            price_match = re.search(
+                r"(?:price|cost|amount)[\\s:\\-]*\\s*(?:[\\$\\u20ac\\u00a3\\u20b9]|USD|EUR|GBP)?\\s*([\\d,.]+)",
+                body_text,
+                re.IGNORECASE,
+            )
+        if price_match:
+            raw_price = price_match.group(1) if price_match.lastindex else price_match.group(0)
+    if raw_price:
+        numeric = re.sub(r"[\\$\\u20ac\\u00a3\\u20b9,]", "", raw_price)
+        try:
+            return float(numeric)
+        except ValueError:
+            return raw_price.strip()
+    return None
+
+def inspect_page_for_requested_info(page: Page, requested_info: list[str], target: str | None = None) -> dict[str, Any]:
+    """Inspect page DOM / text for specific requested information items."""
     results: dict[str, Any] = {}
     if not requested_info:
         return results
@@ -392,6 +321,7 @@ def inspect_page_for_requested_info(page: Page, requested_info: list[str], targe
     if not body_text:
         return results
 
+    results: dict[str, Any] = {}
     for info in requested_info:
         info_lower = info.lower()
 
@@ -436,10 +366,16 @@ def inspect_page_for_requested_info(page: Page, requested_info: list[str], targe
         # Population extraction
         if "population" in info_lower:
             pop_match = re.search(
-                r"(?:^|[\n\r])\s*Population[\s\xa0\n\t•]+(?:[^\n\r]*[\n\r\t]+)?([0-9\.,\s]+(?:billion|million|trillion)?|\d[\d,]+)",
+                r"Population\b[^\n\r\d]{0,80}(?:\b\d{4}\s+(?:estimate|census)\b[^\n\r\d]{0,40})?(\d[\d,]+|\d+(?:\.\d+)?\s*(?:billion|million|trillion))",
                 body_text,
                 re.IGNORECASE,
             )
+            if not pop_match:
+                pop_match = re.search(
+                    r"(?:^|[\n\r])\s*Population[\s\xa0\n\t•]+(?:[^\n\r]*[\n\r\t]+)?([0-9\.,\s]+(?:billion|million|trillion)?|\d[\d,]+)",
+                    body_text,
+                    re.IGNORECASE,
+                )
             if not pop_match:
                 pop_match = re.search(
                     r"Population\s*[:\t\n]?\s*([0-9\.,\s]+(?:billion|million|trillion)?|\d[\d,]+)",
@@ -703,6 +639,9 @@ def choose_goal_exploration_action(
     if not plan:
         return None
 
+    curr_url_lower = getattr(page, "url", "").lower()
+    is_target_sat, _ = memory.is_target_page_satisfied(page)
+
     # A. Auth Barrier Guard (Skill 24): Clean pause if login / CAPTCHA detected
     has_barrier, barrier_desc = check_authentication_barrier(page)
     if has_barrier:
@@ -745,7 +684,37 @@ def choose_goal_exploration_action(
                 "result": dict(memory.extracted_data),
             }
 
-    # D. Table Understanding Policy (Skill 16, 17)
+    # D. Search Input Policy: Check if we need to search on a search engine or platform home
+    is_search_page = (
+        any(seg in curr_url_lower for seg in ["/search", "/results", "?q=", "&q=", "search_query=", "/w/index.php?search="])
+        or (("q=" in curr_url_lower or "query=" in curr_url_lower) and any(se in curr_url_lower for se in ["duckduckgo", "google", "bing", "youtube", "yahoo", "amazon", "flipkart"]))
+    )
+    is_search_needed = (
+        bool(plan.search_query or memory.normalized_query)
+        and not is_search_page
+        and not is_target_sat
+    )
+    if is_search_needed:
+        search_inputs = [
+            e for e in elements
+            if (e.tag in ("input", "textarea") and (e.attributes.get("type") or "").lower() in ("search", "text", ""))
+            or "search" in (e.attributes.get("placeholder") or "").lower()
+            or "search" in (e.attributes.get("name") or "").lower()
+            or "search" in (e.attributes.get("id") or "").lower()
+            or "search" in (e.attributes.get("aria-label") or "").lower()
+        ]
+        if search_inputs:
+            sq = plan.search_query or memory.normalized_query
+            return {
+                "action": "type",
+                "element_id": search_inputs[0].id,
+                "text": sq,
+                "press_enter": True,
+                "reasoning": f"Entering search query '{sq}' into search bar",
+                "confidence": 0.95,
+            }
+
+    # E. Table Understanding Policy (Skill 16, 17)
     if plan.intent == "table_understanding" or getattr(plan, "table_query", ""):
         from browser_agent.perception import extract_tables
         tables = extract_tables(page)
@@ -758,31 +727,41 @@ def choose_goal_exploration_action(
                 "result": dict(memory.extracted_data),
             }
 
-    # E. Comparison Policy (Skill 18)
+    # F. Comparison Policy (Skill 18)
     if plan.intent == "comparison":
-        from browser_agent.constraints import parse_numeric_price, parse_numeric_rating
-        candidates = find_candidate_content_items(elements, query=plan.search_query or memory.normalized_query)
-        comp_records = []
-        limit = max(2, getattr(plan, "comparison_count", 2) or 2)
-        for elem, score, title in candidates[:limit]:
-            t_lower = (elem.text or title).lower()
-            price = parse_numeric_price(t_lower)
-            rating = parse_numeric_rating(t_lower)
-            comp_records.append({
-                "title": title or elem.text[:50],
-                "price": price,  # None if missing (never 0!)
-                "rating": rating, # None if missing
-            })
-        if comp_records:
-            memory.extracted_data["comparison"] = comp_records
-            return {
-                "action": "done",
-                "confidence": 0.95,
-                "reasoning": f"Structured comparison of {len(comp_records)} candidates completed.",
-                "result": dict(memory.extracted_data),
-            }
+        is_search_home = (
+            any(se in curr_url_lower for se in ["duckduckgo.com", "google.com", "bing.com", "yahoo.com"])
+            and not any(seg in curr_url_lower for seg in ["/search", "?q=", "&q="])
+        )
+        if not is_search_home and not is_search_needed:
+            from browser_agent.constraints import parse_numeric_price, parse_numeric_rating
+            candidates = find_candidate_content_items(elements, query=plan.search_query or memory.normalized_query)
+            comp_records = []
+            limit = max(2, getattr(plan, "comparison_count", 2) or 2)
+            for elem, score, title in candidates[:limit]:
+                t_lower = (elem.text or title).lower()
+                price = parse_numeric_price(t_lower)
+                rating = parse_numeric_rating(t_lower)
+                comp_records.append({
+                    "title": title or elem.text[:50],
+                    "price": price,  # None if missing (never 0!)
+                    "rating": rating, # None if missing
+                })
+            has_required_data = True
+            if getattr(plan, "comparison_fields", None) and "price" in plan.comparison_fields:
+                valid_prices = [c for c in comp_records if c.get("price") is not None]
+                if len(valid_prices) < limit:
+                    has_required_data = False
+            if comp_records and len(comp_records) >= limit and has_required_data:
+                memory.extracted_data["comparison"] = comp_records
+                return {
+                    "action": "done",
+                    "confidence": 0.95,
+                    "reasoning": f"Structured comparison of {len(comp_records)} candidates completed.",
+                    "result": dict(memory.extracted_data),
+                }
 
-    # F. Download Policy (Skill 13)
+    # G. Download Policy (Skill 13)
     if plan.intent == "download":
         dl_elem = next((e for e in elements if "download" in (e.text or "").lower() or (e.attributes.get("href") or "").endswith((".pdf", ".zip", ".csv"))), None)
         if dl_elem:
@@ -791,29 +770,6 @@ def choose_goal_exploration_action(
                 "element_id": dl_elem.id,
                 "target": dl_elem.text,
                 "reasoning": f"Clicking download link '{dl_elem.text[:30]}'",
-                "confidence": 0.95,
-            }
-
-    curr_url_lower = page.url.lower()
-
-    # 1. Check if we are on a search engine home or need to search
-    is_search_engine_home = (
-        any(se in curr_url_lower for se in ["duckduckgo.com", "google.com", "bing.com", "yahoo.com"])
-        and not any(seg in curr_url_lower for seg in ["/search", "?q=", "&q="])
-    )
-
-    # If on search engine home, find search input and type query
-    if is_search_engine_home:
-        search_inputs = [
-            e for e in elements
-            if e.tag in ("input", "textarea") or "search" in (e.attributes.get("placeholder") or "").lower() or (e.attributes.get("type") or "").lower() == "search"
-        ]
-        if search_inputs:
-            return {
-                "action": "type",
-                "element_id": search_inputs[0].id,
-                "text": plan.search_query,
-                "reasoning": f"Entering search query '{plan.search_query}' into search bar",
                 "confidence": 0.95,
             }
 
@@ -833,6 +789,8 @@ def choose_goal_exploration_action(
                 query=plan.search_query or memory.normalized_query,
                 target=plan.target,
                 preferred_type=pref,
+                unvisited_only=True,
+                visited_hrefs=getattr(memory, "visited_urls", set()),
             )
         if target_link:
             return {
@@ -853,15 +811,18 @@ def choose_goal_exploration_action(
                     "reasoning": f"Extracted requested info {list(extracted.keys())} from search results without scrolling",
                     "confidence": 0.95,
                 }
-        # If no target link visible, scroll search results
+        # If no target link visible, consider scrolling only if there are potential new links
         if not memory.scroll_state.reached_bottom:
-            return {
-                "action": "scroll",
-                "direction": "down",
-                "amount": 600,
-                "reasoning": f"Target '{plan.target}' not in current viewport; scrolling search results",
-                "confidence": 0.85,
-            }
+            # Determine if any link elements remain that could contain the target or requested info
+            has_potential_links = any(e.tag == "a" or e.role == "link" for e in elements)
+            if has_potential_links:
+                return {
+                    "action": "scroll",
+                    "direction": "down",
+                    "amount": 600,
+                    "reasoning": f"Target '{plan.target}' not in current viewport and more links may be available; scrolling search results",
+                    "confidence": 0.85,
+                }
 
     # 3. Check if we are on TARGET CONTENT PAGE or have active procedural steps
     is_target_sat, _ = memory.is_target_page_satisfied(page)

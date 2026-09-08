@@ -492,8 +492,11 @@ class AgentMemory:
                 return True, f"Video watch page reached: '{curr_title}'."
 
         # CASE 4: General target matching
-        if target_words and all(tw in curr_title or tw in curr_url or tw in h1 for tw in target_words):
-            return True, f"Current page matches target '{target}'."
+        if target_words:
+            matched_words = [tw for tw in target_words if tw in curr_title or tw in curr_url or tw in h1]
+            required_count = len(target_words) if len(target_words) <= 2 else max(2, int(len(target_words) * 0.6))
+            if len(matched_words) >= required_count:
+                return True, f"Current page matches target '{target}' ({len(matched_words)}/{len(target_words)} words matched)."
 
         return False, f"Current page '{curr_title}' does not match target '{target}'."
 

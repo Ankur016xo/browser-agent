@@ -200,10 +200,23 @@ def verify_task_completion(task: str, page: Any, screenshot_path: str | Path) ->
     config = get_config()
     model = config.get("ollama", {}).get("model", "qwen2.5vl:3b")
 
+    curr_url = ""
+    curr_title = ""
+    if page is not None:
+        try:
+            curr_url = str(getattr(page, "url", ""))
+            t = getattr(page, "title", None)
+            curr_title = t() if callable(t) else str(t or "")
+        except Exception:
+            pass
+
+    if not curr_url and not curr_title:
+        return {"verified": False, "reason": "Browser target or page was closed before verification.", "confidence": 0.0}
+
     prompt = VERIFICATION_PROMPT.substitute(
         task=task,
-        url=page.url,
-        title=getattr(page, "title", lambda: "")(),
+        url=curr_url,
+        title=curr_title,
     )
 
     screenshot_str = str(screenshot_path)

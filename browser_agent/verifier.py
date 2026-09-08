@@ -467,3 +467,239 @@ class ActionVerifier:
                 reason=f"Action executed with error during verification: {exc}",
             )
 
+
+
+
+# ---------------------------------------------------------------------------
+# Task-level Invariant Verification (TaskModel & ExecutionState)
+# ---------------------------------------------------------------------------
+from browser_agent.task_model import TaskModel, ConstraintSpec
+from browser_agent.execution_state import ExecutionState, CandidateRecord
+from browser_agent.evidence import Evidence
+
+
+@dataclass
+class TaskVerificationResult:
+    is_complete: bool = False
+    has_valid_candidates: bool = False
+    valid_candidates: list[str] = field(default_factory=list)
+    missing_fields: list[str] = field(default_factory=list)
+    unmet_constraints: list[str] = field(default_factory=list)
+    aggregation_value: Any = None
+    reason: str = ""
+
+    @property
+    def verified(self) -> bool:
+        return self.is_complete
+
+    @verified.setter
+    def verified(self, value: bool) -> None:
+        self.is_complete = value
+
+
+class IndependentVerifier:
+    """Independent verifier that evaluates grounded evidence against TaskModel invariants.
+    
+    Does NOT use screenshots or LLM 'looks-good' heuristics.
+    Re-evaluates validity from scratch without blindly trusting execution state flags.
+    """
+
+    @staticmethod
+    def evaluate_constraint(constraint: ConstraintSpec, value: Any) -> bool:
+        if value is None:
+            return False
+        op = constraint.operator
+        target = constraint.value
+        try:
+            if op == "<=":
+                return float(value) <= float(target)
+            elif op == ">=":
+                return float(value) >= float(target)
+            elif op == "==":
+                return str(value).strip().lower() == str(target).strip().lower()
+            elif op == "!=":
+                return str(value).strip().lower() != str(target).strip().lower()
+            elif op == "contains":
+                return str(target).strip().lower() in str(value).strip().lower()
+            elif op == "in_range":
+                low, high = target
+                return float(low) <= float(value) <= float(high)
+        except (ValueError, TypeError):
+            return False
+        return False
+
+    def verify(self, state: ExecutionState) -> tuple[str, TaskVerificationResult]:
+        """Runs deterministic verification and returns (terminal_state, verification_result).
+        
+        Enforces precedence:
+        BLOCKED / FAILED > NEEDS_CLARIFICATION > INCOMPLETE > SUCCESS > NO_MATCH > UNSET
+        """
+        task = state.task
+        res = TaskVerificationResult()
+
+        # 1. Authoritative Blocker Precedence
+        if state.blocker_state in ("captcha", "auth", "rate_limit"):
+            res.reason = f"Runtime blocker active: {state.blocker_state}"
+            return "BLOCKED", res
+        if state.blocker_state == "unrecoverable" or state.execution_failed:
+            res.reason = f"Execution failed: {state.failure_reason or 'unrecoverable'}"
+            return "FAILED", res
+        if task.ambiguity_state == "needs_clarification":
+            res.reason = "Task ambiguous, needs clarification"
+            return "NEEDS_CLARIFICATION", res
+
+        # 2. Check Required Procedures
+        for proc in task.procedural_requirements:
+            if proc.required and proc.procedure_id in state.failed_procedures:
+                res.reason = f"Required procedure {proc.procedure_id} failed"
+                return "FAILED", res
+
+        # 3. Re-evaluate Candidate Validity from Authoritative Evidence
+        valid_candidates: list[str] = []
+        for cand_id, candidate in state.candidates.items():
+            candidate_evidence = [
+                state.evidence_store[ev_id]
+                for ev_id in candidate.evidence_ids
+                if ev_id in state.evidence_store and state.evidence_store[ev_id].is_trustworthy()
+            ]
+            evidence_by_field: dict[str, Evidence] = {ev.field: ev for ev in candidate_evidence}
+
+            # Check required constraints
+            constraints_passed = True
+            for c in task.constraints:
+                if not c.required:
+                    continue
+                ev = evidence_by_field.get(c.field)
+                if ev is None or not self.evaluate_constraint(c, ev.normalized_value):
+                    constraints_passed = False
+                    break
+
+            if constraints_passed:
+                valid_candidates.append(cand_id)
+
+        res.valid_candidates = valid_candidates
+        res.has_valid_candidates = len(valid_candidates) > 0
+
+        # Check for information extraction / non-candidate tasks
+        info_satisfied = True
+        if task.intent == "information_extraction":
+            trusted_evs = [
+                ev for ev in state.evidence_store.values()
+                if ev.is_trustworthy() and ev.field in task.requested_information
+            ]
+            found_fields = {ev.field for ev in trusted_evs}
+            missing = [f for f in task.requested_information if f not in found_fields]
+            if missing:
+                info_satisfied = False
+                res.missing_fields = missing
+
+        # 4. Check Quantity & Task Criteria
+        if task.intent == "information_extraction":
+            req_satisfied = info_satisfied
+        elif task.intent == "navigation":
+            req_satisfied = len(valid_candidates) >= 1 or info_satisfied or len(task.procedural_requirements) > 0
+        else:
+            req_qty = task.quantity if task.quantity is not None else 1
+            req_satisfied = len(valid_candidates) >= req_qty
+
+        # Check Aggregation
+        if task.aggregation_operation:
+            if task.aggregation_operation == "average" and task.aggregation_field:
+                vals = []
+                for cid in valid_candidates:
+                    for ev_id in state.candidates[cid].evidence_ids:
+                        ev = state.evidence_store[ev_id]
+                        if ev.field == task.aggregation_field and isinstance(ev.normalized_value, (int, float)):
+                            vals.append(ev.normalized_value)
+                if vals:
+                    res.aggregation_value = sum(vals) / len(vals)
+                else:
+                    req_satisfied = False
+
+        # Verify all procedures completed
+        procedures_satisfied = True
+        for proc in task.procedural_requirements:
+            is_proc_done = (proc.procedure_id in state.completed_procedures) or (proc.semantic_target in state.completed_procedures)
+            if proc.required and not is_proc_done:
+                procedures_satisfied = False
+                break
+
+        # 5. Determine Completion
+        if req_satisfied and procedures_satisfied:
+            res.is_complete = True
+            return "SUCCESS", res
+
+        # 6. Distinguish NO_MATCH from INCOMPLETE
+        if state.search_strategies_exhausted and state.candidate_pool_exhausted:
+            if len(valid_candidates) == 0 and task.quantity is not None:
+                res.reason = "Search exhausted with zero valid matches found"
+                return "NO_MATCH", res
+
+        res.reason = "Task execution incomplete or budget exhausted before proving completion"
+        return "INCOMPLETE", res
+
+
+def resolve_terminal_state(
+    state: ExecutionState,
+    verifier: IndependentVerifier | None = None,
+) -> tuple[str, TaskVerificationResult]:
+    """Central deterministic terminal-state resolution function.
+    
+    Enforces strict invariant precedence:
+    BLOCKED / FAILED
+        >
+    NEEDS_CLARIFICATION
+        >
+    INCOMPLETE
+        >
+    SUCCESS
+        >
+    NO_MATCH
+        >
+    UNSET
+
+    No VLM result, heuristic, procedure tracker, or action result can directly emit final SUCCESS.
+    Only this resolver determines the final terminal state.
+    """
+    if verifier is None:
+        verifier = IndependentVerifier()
+
+    res = TaskVerificationResult()
+
+    # 1. Authoritative Blocker / Failure (Highest Priority)
+    if state.blocker_state in ("captcha", "auth", "rate_limit"):
+        res.reason = f"Runtime blocker active: {state.blocker_state}"
+        res.is_complete = False
+        res.verified = False
+        return "BLOCKED", res
+
+    if state.blocker_state == "unrecoverable" or state.execution_failed:
+        res.reason = f"Execution failed: {state.failure_reason or 'unrecoverable'}"
+        res.is_complete = False
+        res.verified = False
+        return "FAILED", res
+
+    # 2. Needs Clarification
+    if state.task and state.task.ambiguity_state == "needs_clarification":
+        res.reason = "Task ambiguous, needs clarification"
+        res.is_complete = False
+        res.verified = False
+        return "NEEDS_CLARIFICATION", res
+
+    # 3. Independent Verification over deterministic state
+    v_status, v_res = verifier.verify(state)
+
+    if v_status in ("BLOCKED", "FAILED", "NEEDS_CLARIFICATION"):
+        return v_status, v_res
+
+    if v_status == "INCOMPLETE":
+        # INCOMPLETE strictly beats SUCCESS and NO_MATCH
+        return "INCOMPLETE", v_res
+
+    if v_status == "SUCCESS":
+        return "SUCCESS", v_res
+
+    if v_status == "NO_MATCH":
+        return "NO_MATCH", v_res
+
+    return "UNSET", v_res
