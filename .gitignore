@@ -3,9 +3,24 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+*.egg-info/
+dist/
+build/
 
 # Agent screenshots
 *.png
 
 # Environment / secrets
 .env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Node
+node_modules/
+dist/
+.bolt/
+.v3/

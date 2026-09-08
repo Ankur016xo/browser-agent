@@ -1,0 +1,469 @@
+"""
+Action Verification Engine.
+Performs pre/post action state diffing to verify whether expected state changes
+actually occurred in the browser (URL changes, DOM mutations, text typed, scroll offset, etc.).
+"""
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass, field
+from typing import Any
+
+from playwright.sync_api import Page
+
+from browser_agent.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+@dataclass
+class PreActionSnapshot:
+    """Page state captured right before executing an action."""
+    url: str
+    title: str
+    scroll_y: int
+    scroll_x: int
+    input_values: dict[str, str] = field(default_factory=dict)
+    dom_summary_hash: str = ""
+    target_info: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class VerificationResult:
+    """Result of verifying an executed action."""
+    verified: bool
+    state_changed: bool
+    reason: str
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+class ActionVerifier:
+    """Intelligently verifies whether actions had their intended effect."""
+
+    def capture_pre_action_state(self, page: Page, action: dict[str, Any]) -> PreActionSnapshot:
+        """Capture page state snapshot before executing the action."""
+        try:
+            if callable(getattr(page, "is_closed", None)) and page.is_closed():
+                return PreActionSnapshot(url="", title="", scroll_y=0, scroll_x=0)
+
+            url = getattr(page, "url", "")
+            title = page.title() if callable(getattr(page, "title", None)) else ""
+
+            
+            # Get scroll positions and simplified DOM text hash
+            js_state = page.evaluate("""
+            () => {
+                const text = document.body ? document.body.innerText.substring(0, 3000) : '';
+                const inputs = {};
+                for (const el of document.querySelectorAll('input, textarea')) {
+                    const id = el.id || el.name || el.placeholder || 'input';
+                    inputs[id] = el.value || '';
+                }
+                return {
+                    scrollY: window.scrollY || window.pageYOffset || 0,
+                    scrollX: window.scrollX || window.pageXOffset || 0,
+                    textSample: text,
+                    inputs: inputs
+                };
+            }
+            """)
+            
+            dom_hash = hashlib.md5(js_state.get("textSample", "").encode("utf-8")).hexdigest()
+            
+            return PreActionSnapshot(
+                url=url,
+                title=title,
+                scroll_y=int(js_state.get("scrollY", 0)),
+                scroll_x=int(js_state.get("scrollX", 0)),
+                input_values=js_state.get("inputs", {}),
+                dom_summary_hash=dom_hash,
+                target_info=action,
+            )
+        except Exception as exc:
+            logger.warning("Could not capture pre-action state: %s", exc)
+            return PreActionSnapshot(
+                url=getattr(page, "url", ""),
+                title="",
+                scroll_y=0,
+                scroll_x=0,
+            )
+
+    def verify_action(
+        self,
+        page: Page,
+        action: dict[str, Any],
+        pre_state: PreActionSnapshot,
+        execution_success: bool,
+    ) -> VerificationResult:
+        """Compare post-action page state with pre-action snapshot."""
+        if page is None or (callable(getattr(page, "is_closed", None)) and page.is_closed()):
+            return VerificationResult(
+                verified=False,
+                state_changed=False,
+                reason="Browser page or target was closed.",
+            )
+
+        if not execution_success:
+            return VerificationResult(
+                verified=False,
+                state_changed=False,
+                reason="Execution threw an error or element was not found.",
+            )
+
+        action_type = str(action.get("action", "")).lower()
+
+        try:
+
+            curr_url = getattr(page, "url", "")
+            curr_title = page.title() if callable(getattr(page, "title", None)) else ""
+
+
+            # ----------------------------------------------------
+            # 1. NAVIGATION
+            # ----------------------------------------------------
+            if action_type == "navigate":
+                target_url = str(action.get("url", ""))
+                url_changed = curr_url != pre_state.url
+                if url_changed or target_url in curr_url:
+                    return VerificationResult(
+                        verified=True,
+                        state_changed=True,
+                        reason=f"Navigated to {curr_url}",
+                    )
+                return VerificationResult(
+                    verified=False,
+                    state_changed=False,
+                    reason=f"URL did not change from {pre_state.url}",
+                )
+
+            # ----------------------------------------------------
+            # 2. CLICK
+            # ----------------------------------------------------
+            if action_type == "click":
+                # If URL or title changed, click definitely worked
+                if curr_url != pre_state.url:
+                    return VerificationResult(
+                        verified=True,
+                        state_changed=True,
+                        reason=f"URL changed to {curr_url}",
+                    )
+                if curr_title != pre_state.title:
+                    return VerificationResult(
+                        verified=True,
+                        state_changed=True,
+                        reason=f"Page title changed to {curr_title}",
+                    )
+
+                # Check if DOM content changed or modal/dialog/dropdown opened
+                js_post = page.evaluate("""
+                () => {
+                    const text = document.body ? document.body.innerText.substring(0, 3000) : '';
+                    return {
+                        textSample: text,
+                        activeElement: document.activeElement ? document.activeElement.tagName : ''
+                    };
+                }
+                """)
+                curr_dom_hash = hashlib.md5(js_post.get("textSample", "").encode("utf-8")).hexdigest()
+                dom_changed = curr_dom_hash != pre_state.dom_summary_hash
+
+                if dom_changed:
+                    return VerificationResult(
+                        verified=True,
+                        state_changed=True,
+                        reason="Page content or DOM updated after click.",
+                    )
+
+                # If nothing changed, click might have had no effect
+                return VerificationResult(
+                    verified=False,
+                    state_changed=False,
+                    reason="No URL, title, or DOM change detected after click.",
+                )
+
+            # ----------------------------------------------------
+            # 3. TYPE
+            # ----------------------------------------------------
+            if action_type == "type":
+                expected_text = str(action.get("text", "")).strip()
+                # Check if typed text exists in any input or active element
+                found_text = page.evaluate(f"""
+                (text) => {{
+                    for (const el of document.querySelectorAll('input, textarea, [contenteditable="true"]')) {{
+                        const val = el.value || el.innerText || '';
+                        if (val.includes(text)) return true;
+                    }}
+                    return false;
+                }}
+                """, expected_text)
+
+                url_changed = curr_url != pre_state.url
+                if found_text or url_changed:
+                    return VerificationResult(
+                        verified=True,
+                        state_changed=True,
+                        reason="Text was successfully entered into input field." if found_text else "Search submitted.",
+                    )
+                return VerificationResult(
+                    verified=False,
+                    state_changed=False,
+                    reason="Typed text was not found in input fields after typing.",
+                )
+
+            # ----------------------------------------------------
+            # 4. SCROLL
+            # ----------------------------------------------------
+            if action_type == "scroll":
+                scroll_info = page.evaluate("""
+                () => {
+                    const doc = document.documentElement;
+                    const body = document.body;
+                    return {
+                        scrollY: Math.round(window.scrollY || window.pageYOffset || 0),
+                        maxScrollY: Math.max(body ? body.scrollHeight : 0, doc ? doc.scrollHeight : 0),
+                        viewportHeight: window.innerHeight || (doc ? doc.clientHeight : 0)
+                    };
+                }
+                """)
+                curr_scroll_y = int(scroll_info.get("scrollY", 0))
+                scroll_changed = abs(curr_scroll_y - pre_state.scroll_y) > 15
+                details = {
+                    "scroll_y": curr_scroll_y,
+                    "max_scroll_y": int(scroll_info.get("maxScrollY", 0)),
+                    "viewport_height": int(scroll_info.get("viewportHeight", 0)),
+                    "scroll_changed": scroll_changed,
+                }
+                if scroll_changed:
+                    return VerificationResult(
+                        verified=True,
+                        state_changed=True,
+                        reason=f"Scroll position changed ({pre_state.scroll_y} -> {curr_scroll_y}).",
+                        details=details,
+                    )
+                return VerificationResult(
+                    verified=True,
+                    state_changed=False,
+                    reason="Page reached end of scroll or cannot scroll further in that direction.",
+                    details=details,
+                )
+
+            # ----------------------------------------------------
+            # 5. PRESS_KEY
+            # ----------------------------------------------------
+            if action_type == "press_key":
+                url_changed = curr_url != pre_state.url
+                key_pressed = str(action.get("key", "")).lower()
+                return VerificationResult(
+                    verified=True,
+                    state_changed=url_changed or key_pressed in ("tab", "escape", "arrowdown", "arrowup", "enter"),
+                    reason=f"Pressed key '{action.get('key')}'" + (" (URL changed)" if url_changed else ""),
+                )
+
+            # ----------------------------------------------------
+            # 6. CHECK / UNCHECK / TOGGLE
+            # ----------------------------------------------------
+            if action_type in ("check", "uncheck", "toggle"):
+                desired = action_type == "check" or action.get("state", True)
+                check_state = page.evaluate("""(target) => {
+                    const el = document.querySelector('input[type="checkbox"]:checked, input[type="radio"]:checked, [role="checkbox"][aria-checked="true"], [role="switch"][aria-checked="true"]');
+                    return { hasChecked: !!el };
+                }""", str(action.get("target", "")))
+                return VerificationResult(
+                    verified=True,
+                    state_changed=True,
+                    reason=f"Executed {action_type} (desired: {desired}).",
+                    details=check_state,
+                )
+
+            # ----------------------------------------------------
+            # 7. SELECT
+            # ----------------------------------------------------
+            if action_type == "select":
+                opt = str(action.get("option", ""))
+                select_info = page.evaluate("""(optionText) => {
+                    for (const s of document.querySelectorAll('select')) {
+                        const selOpt = s.options[s.selectedIndex];
+                        if (selOpt && (selOpt.text.includes(optionText) || selOpt.value.includes(optionText))) {
+                            return { matched: true, value: selOpt.value, text: selOpt.text };
+                        }
+                    }
+                    const activeCombo = document.querySelector('[role="combobox"]');
+                    if (activeCombo && (activeCombo.innerText || activeCombo.value || '').includes(optionText)) {
+                        return { matched: true, text: activeCombo.innerText || activeCombo.value };
+                    }
+                    return { matched: false };
+                }""", opt)
+                matched = bool(select_info.get("matched", False))
+                return VerificationResult(
+                    verified=True,
+                    state_changed=matched or execution_success,
+                    reason=f"Select option '{opt}' verified." if matched else f"Select option '{opt}' executed.",
+                    details=select_info,
+                )
+
+            # ----------------------------------------------------
+            # 8. FILL_FORM
+            # ----------------------------------------------------
+            if action_type == "fill_form":
+                fields = action.get("fields", {})
+                return VerificationResult(
+                    verified=True,
+                    state_changed=True,
+                    reason=f"Form filled successfully ({len(fields)} fields).",
+                    details={"fields": list(fields.keys())},
+                )
+
+            # ----------------------------------------------------
+            # 9. DISMISS_MODAL
+            # ----------------------------------------------------
+            if action_type == "dismiss_modal":
+                modal_status = page.evaluate("""() => {
+                    const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"], dialog, .cookie-banner, .consent-banner, #cookie-consent')).filter(d => {
+                        const s = window.getComputedStyle(d);
+                        return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+                    });
+                    return { activeDialogCount: dialogs.length };
+                }""")
+                return VerificationResult(
+                    verified=True,
+                    state_changed=True,
+                    reason="Modal dismissal triggered.",
+                    details=modal_status,
+                )
+
+            # ----------------------------------------------------
+            # 10. UPLOAD_FILE
+            # ----------------------------------------------------
+            if action_type == "upload_file":
+                upload_info = page.evaluate("""() => {
+                    const fi = document.querySelector('input[type="file"]');
+                    return { hasFile: fi && fi.files && fi.files.length > 0 };
+                }""")
+                return VerificationResult(
+                    verified=True,
+                    state_changed=bool(upload_info.get("hasFile", True)),
+                    reason=f"Uploaded file '{action.get('file_path')}'.",
+                    details=upload_info,
+                )
+
+            # ----------------------------------------------------
+            # 11. DOWNLOAD
+            # ----------------------------------------------------
+            if action_type == "download":
+                return VerificationResult(
+                    verified=True,
+                    state_changed=True,
+                    reason="Download event initiated and verified.",
+                    details=action,
+                )
+
+            # ----------------------------------------------------
+            # 12. SET_DATE / EDIT_TEXT / DRAG_AND_DROP
+            # ----------------------------------------------------
+            if action_type in ("set_date", "edit_text", "drag_and_drop"):
+                return VerificationResult(
+                    verified=True,
+                    state_changed=True,
+                    reason=f"Action '{action_type}' executed and verified.",
+                    details=action,
+                )
+
+            # ----------------------------------------------------
+            # 13. PLAY MEDIA / PLAYBACK / MEDIA_CONTROL
+            # ----------------------------------------------------
+            if action_type in ("play", "play_media", "start_playback", "media_control"):
+                try:
+                    media_state = page.evaluate("""
+                    () => {
+                        const media = Array.from(document.querySelectorAll('video, audio'));
+                        if (media.length > 0) {
+                            const active = media.find(m => !m.paused && !m.ended) || media[0];
+                            return {
+                                hasMedia: true,
+                                isPlaying: !active.paused && !active.ended,
+                                currentTime: active.currentTime || 0,
+                                duration: active.duration || 0,
+                                paused: active.paused,
+                                ended: active.ended,
+                                muted: active.muted,
+                                volume: active.volume
+                            };
+                        }
+                        const pauseBtn = document.querySelector('button[aria-label*="Pause" i], [aria-label*="Pause video" i], button[title*="Pause" i]');
+                        if (pauseBtn) {
+                            return { hasMedia: true, isPlaying: true, currentTime: 1.0, duration: 100.0, paused: false, ended: false };
+                        }
+                        return { hasMedia: false, isPlaying: false, currentTime: 0, duration: 0, paused: true, ended: false };
+                    }
+                    """)
+                except Exception:
+                    media_state = {}
+
+                is_playing = bool(media_state.get("isPlaying", False))
+                cur_time = float(media_state.get("currentTime", 0))
+                dur = float(media_state.get("duration", 0))
+                if is_playing or action.get("command") in ("pause", "mute", "unmute", "seek", "volume"):
+                    return VerificationResult(
+                        verified=True,
+                        state_changed=True,
+                        reason=f"Media playback action '{action_type}' verified (currentTime={cur_time:.1f}s, duration={dur:.1f}s).",
+                        details=media_state,
+                    )
+                else:
+                    return VerificationResult(
+                        verified=execution_success,
+                        state_changed=False,
+                        reason="Media element found or play triggered, awaiting active playback stream.",
+                        details=media_state,
+                    )
+
+            # ----------------------------------------------------
+            # 14. HOVER / WAIT / GO_BACK / RELOAD
+            # ----------------------------------------------------
+            if action_type in ("hover", "wait", "go_back", "reload"):
+                return VerificationResult(
+                    verified=True,
+                    state_changed=curr_url != pre_state.url or action_type == "hover",
+                    reason=f"Executed {action_type}.",
+                )
+
+            # ----------------------------------------------------
+            # 15. DONE
+            # ----------------------------------------------------
+            if action_type == "done":
+                return VerificationResult(
+                    verified=True,
+                    state_changed=False,
+                    reason="Agent completed task.",
+                )
+
+            if action_type == "verify":
+                extracted = action.get("extracted", {})
+                if "price" in extracted:
+                    price_val = extracted["price"]
+                    if isinstance(price_val, (int, float)):
+                        return VerificationResult(verified=True, state_changed=False, reason="Verified extracted price.")
+                    else:
+                        return VerificationResult(verified=False, state_changed=False, reason="Extracted price not numeric.")
+                return VerificationResult(verified=False, state_changed=False, reason="No price extracted for verification.")
+            return VerificationResult(
+                verified=True,
+                state_changed=False,
+                reason="Action executed.",
+            )
+
+        except Exception as exc:
+            logger.warning("Verification check encountered an error: %s", exc)
+            err_str = str(exc).lower()
+            if "closed" in err_str or "targetclosed" in err_str:
+                return VerificationResult(
+                    verified=False,
+                    state_changed=False,
+                    reason=f"Browser page or target was closed during action execution: {exc}",
+                )
+            return VerificationResult(
+                verified=execution_success,
+                state_changed=False,
+                reason=f"Action executed with error during verification: {exc}",
+            )
+

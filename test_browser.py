@@ -9,6 +9,6 @@ with sync_playwright() as p:
 
     print("Screenshot saved as google.png")
 
-    input("Press Enter to close...")
+# input("Press Enter to close..." )
 
     browser.close()

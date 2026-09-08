@@ -1,0 +1,21 @@
+[ollama]
+url = "http://localhost:11434"
+model = "qwen2.5vl:3b"
+timeout = 30.0
+
+[browser]
+headless = false
+viewport_width = 1280
+viewport_height = 800
+start_url = "https://duckduckgo.com"
+page_load_timeout = 2000
+step_wait_timeout = 1000
+
+[agent]
+max_steps = 10
+screenshot_path = "agent_screen.png"
+screenshot_quality = 80
+
+[logging]
+level = "INFO"
+format = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"

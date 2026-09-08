@@ -1,0 +1,26 @@
+[project]
+name = "browser-agent"
+version = "0.1.0"
+description = "Lightweight on-device visual browser agent using local vision models"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "playwright>=1.62.0",
+    "ollama>=0.6.0",
+    "pillow>=10.0.0",
+]
+
+[project.scripts]
+browser-agent = "browser_agent.agent:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["browser_agent*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
