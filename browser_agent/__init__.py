@@ -6,6 +6,13 @@ from browser_agent.state import AgentMemory, AgentState, ElementInfo, ActionReco
 from browser_agent.perception import PerceptionEngine
 from browser_agent.verifier import ActionVerifier
 from browser_agent.loop_detector import LoopDetector
+from browser_agent.inspection import inspect_page_structure, inspect_requested_information
+
+# Install the generic DOM-first inspector into the existing exploration pipeline.
+# This keeps the legacy orchestration API stable while replacing brittle
+# field-specific page parsing with structural inspection.
+from browser_agent.inspection_hook import install_dom_first_inspection
+install_dom_first_inspection()
 
 __version__ = "0.2.0"
 
@@ -29,4 +36,6 @@ __all__ = [
     "PerceptionEngine",
     "ActionVerifier",
     "LoopDetector",
+    "inspect_page_structure",
+    "inspect_requested_information",
 ]
